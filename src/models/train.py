@@ -1,7 +1,8 @@
 """
-ML Model Training with MLflow Tracking
-Models: Logistic Regression, Random Forest, XGBoost
-Target: OOP critically high (>55%) vs moderate (40-55%)
+ML Model Training — Regression Approach
+Target: Predict OOP % of health expenditure (continuous)
+Models: Ridge, Random Forest, XGBoost + SHAP explainability
+MLflow tracked
 """
 
 import pandas as pd
@@ -9,17 +10,19 @@ import numpy as np
 import mlflow
 import mlflow.sklearn
 import mlflow.xgboost
-from sklearn.model_selection import StratifiedKFold, cross_val_score, LeaveOneOut
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import KFold, cross_val_score, cross_validate
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import xgboost as xgb
 import shap
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import logging, os
+import warnings, logging, os
+warnings.filterwarnings("ignore")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,22 +40,17 @@ FEATURES = [
     "ncd_mortality_30_70_pct",
     "time_trend",
 ]
-BLUE = "#1F4E79"
+TARGET = "oop_pct_current_health_exp"
+BLUE   = "#1F4E79"
 
 
-def prepare_features(df: pd.DataFrame):
+def prepare_data(df: pd.DataFrame):
     df = df.copy()
     df["time_trend"] = df["year"] - df["year"].min()
-
-    # New target: critically high OOP (>55%) = 1, moderate (<=55%) = 0
-    df["oop_critical"] = (df["oop_pct_current_health_exp"] > 55).astype(int)
-
-    df_clean = df.dropna(subset=FEATURES + ["oop_critical"])
+    df_clean = df.dropna(subset=FEATURES + [TARGET])
     X = df_clean[FEATURES]
-    y = df_clean["oop_critical"]
-
-    logger.info(f"Dataset: {len(X)} samples")
-    logger.info(f"Target distribution: Critical OOP>55%: {sum(y==1)} | Moderate: {sum(y==0)}")
+    y = df_clean[TARGET]
+    logger.info(f"Dataset: {len(X)} samples | Target range: {y.min():.1f}% – {y.max():.1f}%")
     return X, y
 
 
@@ -60,58 +58,78 @@ def train_and_log(name: str, model, X, y):
     mlflow.set_tracking_uri("./mlflow_runs")
     mlflow.set_experiment("pakistan_oop_ml_models")
 
-    # Small dataset — use LeaveOneOut CV
-    loo = LeaveOneOut()
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    with mlflow.start_run(run_name=f"{name}_v1"):
+    with mlflow.start_run(run_name=f"{name}_regression_v1"):
         mlflow.log_param("model",      name)
+        mlflow.log_param("task",       "regression")
+        mlflow.log_param("target",     TARGET)
         mlflow.log_param("n_features", len(FEATURES))
         mlflow.log_param("n_samples",  len(X))
-        mlflow.log_param("cv_method",  "LeaveOneOut")
-        mlflow.log_param("target",     "oop_critical_55pct")
 
-        auc = cross_val_score(model, X, y, cv=loo, scoring="roc_auc")
-        f1  = cross_val_score(model, X, y, cv=loo, scoring="f1_macro")
-        acc = cross_val_score(model, X, y, cv=loo, scoring="accuracy")
+        cv_results = cross_validate(
+            model, X, y, cv=cv,
+            scoring={"r2": "r2", "mae": "neg_mean_absolute_error",
+                     "rmse": "neg_root_mean_squared_error"},
+            return_train_score=False
+        )
 
-        mlflow.log_metric("loo_auc_mean", round(auc.mean(), 4))
-        mlflow.log_metric("loo_f1_mean",  round(f1.mean(),  4))
-        mlflow.log_metric("loo_acc_mean", round(acc.mean(), 4))
+        r2   = cv_results["test_r2"].mean()
+        mae  = -cv_results["test_mae"].mean()
+        rmse = -cv_results["test_rmse"].mean()
+
+        mlflow.log_metric("cv_r2_mean",   round(r2,   4))
+        mlflow.log_metric("cv_mae_mean",  round(mae,  4))
+        mlflow.log_metric("cv_rmse_mean", round(rmse, 4))
 
         model.fit(X, y)
         mlflow.sklearn.log_model(model, name)
 
-        logger.info(f"{name:25s} | AUC: {auc.mean():.4f} "
-                    f"| F1: {f1.mean():.4f} | Acc: {acc.mean():.4f}")
-    return model, {"auc": round(auc.mean(),4),
-                   "f1":  round(f1.mean(),4),
-                   "acc": round(acc.mean(),4)}
+        logger.info(f"{name:25s} | R²: {r2:.4f} | MAE: {mae:.4f} | RMSE: {rmse:.4f}")
+
+    return model, {"r2": round(r2,4), "mae": round(mae,4), "rmse": round(rmse,4)}
 
 
 def shap_plot(model, X: pd.DataFrame, name: str):
-    clf = model
-    X_plot = X.copy()
+    clf   = model
+    X_plt = X.copy()
+
     if hasattr(model, "named_steps"):
         clf = model.named_steps["clf"]
         if "scaler" in model.named_steps:
-            X_plot = pd.DataFrame(
+            X_plt = pd.DataFrame(
                 model.named_steps["scaler"].transform(X),
                 columns=FEATURES
             )
+
     try:
         explainer = shap.TreeExplainer(clf)
-        sv        = explainer.shap_values(X_plot)
-        vals      = sv[1] if isinstance(sv, list) else sv
+        sv        = explainer.shap_values(X_plt)
 
-        mean_shap = np.abs(vals).mean(axis=0)
+        mean_shap = np.abs(sv).mean(axis=0)
         idx       = np.argsort(mean_shap)
+        feat_labels = [f.replace("_", " ").title() for f in FEATURES]
 
-        fig, ax = plt.subplots(figsize=(9, 5))
-        colors  = [plt.cm.RdYlGn(v / mean_shap.max()) for v in mean_shap[idx]]
-        ax.barh([FEATURES[i] for i in idx], mean_shap[idx], color=colors)
-        ax.set_title(f"SHAP Feature Importance — {name}\nPredicting Critical OOP (>55%)",
-                     fontweight="bold", color=BLUE)
-        ax.set_xlabel("Mean |SHAP value|")
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Bar chart
+        colors = plt.cm.RdYlGn_r(mean_shap[idx] / mean_shap.max())
+        axes[0].barh([feat_labels[i] for i in idx], mean_shap[idx], color=colors)
+        axes[0].set_title(f"SHAP Feature Importance\n{name} — Predicting OOP %",
+                          fontweight="bold", color=BLUE)
+        axes[0].set_xlabel("Mean |SHAP value| (percentage points)")
+
+        # Scatter: actual vs predicted
+        y_pred = clf.predict(X_plt)
+        axes[1].scatter(X["time_trend"] + 2000, y_pred,
+                        color=BLUE, s=60, label="Predicted", alpha=0.8)
+        axes[1].plot(X["time_trend"] + 2000,
+                     [TARGET] * len(X) if isinstance(TARGET, float) else [0]*len(X),
+                     color="gray", linewidth=0)
+        axes[1].set_title(f"Predicted OOP % Over Time\n{name}",
+                          fontweight="bold", color=BLUE)
+        axes[1].set_xlabel("Year"); axes[1].set_ylabel("Predicted OOP %")
+
         plt.tight_layout()
         path = f"reports/shap_{name.lower().replace(' ', '_')}.png"
         plt.savefig(path, dpi=150, bbox_inches="tight")
@@ -121,31 +139,64 @@ def shap_plot(model, X: pd.DataFrame, name: str):
         logger.warning(f"SHAP skipped for {name}: {e}")
 
 
+def actual_vs_predicted_plot(models_dict: dict, X, y):
+    fig, axes = plt.subplots(1, len(models_dict), figsize=(15, 4))
+    years = X["time_trend"].values + 2000
+
+    for ax, (name, model) in zip(axes, models_dict.items()):
+        clf   = model
+        X_plt = X.copy()
+        if hasattr(model, "named_steps"):
+            clf = model.named_steps["clf"]
+            if "scaler" in model.named_steps:
+                X_plt = pd.DataFrame(
+                    model.named_steps["scaler"].transform(X), columns=FEATURES)
+
+        y_pred = model.predict(X)
+        r2     = r2_score(y, y_pred)
+        mae    = mean_absolute_error(y, y_pred)
+
+        ax.plot(years, y.values,   "o-", color="#C00000", lw=2, label="Actual",    ms=5)
+        ax.plot(years, y_pred,     "s--",color=BLUE,      lw=2, label="Predicted", ms=5)
+        ax.axhline(40, color="orange", linestyle=":", alpha=0.7, label="WHO 40%")
+        ax.set_title(f"{name}\nR²={r2:.3f} | MAE={mae:.2f}pp",
+                     fontweight="bold", fontsize=10)
+        ax.set_xlabel("Year"); ax.set_ylabel("OOP %")
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Actual vs Predicted OOP % — Pakistan 2000–2023",
+                 fontsize=13, fontweight="bold", color=BLUE)
+    plt.tight_layout()
+    plt.savefig("reports/08_actual_vs_predicted.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("✅ reports/08_actual_vs_predicted.png")
+
+
 def model_comparison_plot(results: dict):
     names = list(results.keys())
-    aucs  = [results[n]["auc"] for n in names]
-    f1s   = [results[n]["f1"]  for n in names]
-    accs  = [results[n]["acc"] for n in names]
+    r2s   = [results[n]["r2"]   for n in names]
+    maes  = [results[n]["mae"]  for n in names]
+    rmses = [results[n]["rmse"] for n in names]
 
-    x = np.arange(len(names))
-    w = 0.25
-    fig, ax = plt.subplots(figsize=(10, 5))
-    b1 = ax.bar(x - w, aucs, w, label="AUC (LOO)",   color="#1F4E79", alpha=0.85)
-    b2 = ax.bar(x,     f1s,  w, label="F1 Macro",    color="#2E75B6", alpha=0.85)
-    b3 = ax.bar(x + w, accs, w, label="Accuracy",    color="#9DC3E6", alpha=0.85)
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    colors = ["#1F4E79", "#2E75B6", "#9DC3E6"]
 
-    for bar in [b1, b2, b3]:
-        for rect in bar:
-            h = rect.get_height()
-            ax.text(rect.get_x() + rect.get_width()/2, h + 0.01,
-                    f"{h:.3f}", ha="center", va="bottom", fontsize=9)
+    for ax, vals, label, fmt in zip(
+        axes,
+        [r2s, maes, rmses],
+        ["R² Score (higher=better)", "MAE — pp (lower=better)", "RMSE — pp (lower=better)"],
+        [".3f", ".2f", ".2f"]
+    ):
+        bars = ax.bar(names, vals, color=colors, alpha=0.85, edgecolor="white")
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f"{v:{fmt}}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.set_title(label, fontweight="bold", color=BLUE)
+        ax.set_ylim(0, max(vals) * 1.25)
+        ax.tick_params(axis="x", rotation=15)
 
-    ax.set_xticks(x); ax.set_xticklabels(names, fontsize=11)
-    ax.set_ylim(0, 1.15)
-    ax.axhline(0.8, color="orange", linestyle="--", alpha=0.6, label="0.8 benchmark")
-    ax.set_title("Model Comparison — Pakistan Critical OOP Prediction\n(Leave-One-Out CV, n=24)",
+    fig.suptitle("Model Comparison — OOP % Regression (5-Fold CV)\nPakistan 2000–2023",
                  fontsize=13, fontweight="bold", color=BLUE)
-    ax.set_ylabel("Score"); ax.legend()
     plt.tight_layout()
     plt.savefig("reports/07_model_comparison.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -154,50 +205,53 @@ def model_comparison_plot(results: dict):
 
 def run_all(csv_path: str = "data/processed/merged_pakistan_health.csv"):
     df = pd.read_csv(csv_path)
-    X, y = prepare_features(df)
+    X, y = prepare_data(df)
 
     models = {
-        "Logistic Regression": Pipeline([
+        "Ridge Regression": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=1000, C=0.5,
-                                       class_weight="balanced", random_state=42))
+            ("clf", Ridge(alpha=1.0))
         ]),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=100, max_depth=3,
-            class_weight="balanced", random_state=42
+        "Random Forest": RandomForestRegressor(
+            n_estimators=200, max_depth=4, random_state=42
         ),
-        "XGBoost": xgb.XGBClassifier(
-            n_estimators=100, max_depth=2, learning_rate=0.1,
-            scale_pos_weight=sum(y==0)/max(sum(y==1), 1),
-            eval_metric="auc", random_state=42
+        "XGBoost": xgb.XGBRegressor(
+            n_estimators=200, max_depth=3, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric="rmse", random_state=42
         ),
     }
 
     all_results = {}
     trained     = {}
+
     for name, model in models.items():
-        m, res       = train_and_log(name, model, X, y)
-        trained[name] = m
+        m, res          = train_and_log(name, model, X, y)
+        trained[name]   = m
         all_results[name] = res
 
-    print("\n" + "="*55)
-    print("MODEL COMPARISON — Critical OOP Prediction (LOO-CV)")
-    print("="*55)
-    print(f"{'Model':<25} {'AUC':>8} {'F1':>8} {'Acc':>8}")
-    print("-"*55)
+    print("\n" + "="*58)
+    print("MODEL COMPARISON — OOP % Regression (5-Fold CV)")
+    print("="*58)
+    print(f"{'Model':<25} {'R²':>8} {'MAE(pp)':>10} {'RMSE(pp)':>10}")
+    print("-"*58)
     for n, r in all_results.items():
-        print(f"{n:<25} {r['auc']:>8.4f} {r['f1']:>8.4f} {r['acc']:>8.4f}")
+        print(f"{n:<25} {r['r2']:>8.4f} {r['mae']:>10.4f} {r['rmse']:>10.4f}")
 
-    best = max(all_results, key=lambda x: all_results[x]["auc"])
-    print(f"\n🏆 Best: {best} (AUC: {all_results[best]['auc']:.4f})")
+    best = max(all_results, key=lambda x: all_results[x]["r2"])
+    print(f"\n🏆 Best Model: {best} (R²: {all_results[best]['r2']:.4f})")
 
     for name in ["Random Forest", "XGBoost"]:
         shap_plot(trained[name], X, name)
 
+    actual_vs_predicted_plot(trained, X, y)
     model_comparison_plot(all_results)
+
     return trained, all_results
 
 
 if __name__ == "__main__":
     trained, results = run_all()
-    print("\n✅ Done! Reports in reports/ | MLflow: http://localhost:5000")
+    print("\n✅ All done!")
+    print("✅ Plots in reports/")
+    print("✅ MLflow: http://localhost:5000")
