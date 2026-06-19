@@ -1,0 +1,22 @@
+# Environment
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Data (raw data never pushed to GitHub)
+data/raw/
+data/processed/
+
+# MLflow
+mlflow_runs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Conda
+*.conda
