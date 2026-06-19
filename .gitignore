@@ -2,12 +2,9 @@
 .env
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
 
-# Data (raw data never pushed to GitHub)
+# Raw data only (never push)
 data/raw/
-data/processed/
 
 # MLflow
 mlflow_runs/
